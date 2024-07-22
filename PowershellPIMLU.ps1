@@ -1,72 +1,60 @@
-$Scopes = @(
-    "RoleManagementPolicy.Read.AzureADGroup",
-    "AuditLog.Read.All",
-    "Directory.Read.All",
-    "Group.Read.All",
-    "User.Read.All"
+# Connect to Azure and Microsoft Graph
+Connect-AzAccount
+Connect-MgGraph -Scopes "User.Read.All", "RoleManagement.Read.All", "Directory.Read.All"
+
+# Define an array of user objects
+$users = @(
+    [PSCustomObject]@{UserPrincipalName="user1@yourtenant.com"},
+    [PSCustomObject]@{UserPrincipalName="user2@yourtenant.com"}
 )
 
-Connect-MgGraph -Scopes $Scopes
+# Create a list to hold the results
+$results = @()
 
-$EligibleEntraUserData = @()
-$EligibleEntraGroupData = @()
+foreach ($user in $users) {
+    $userPrincipalName = $user.UserPrincipalName
 
-$EligileAssignments = Get-MgRoleManagementDirectoryRoleEligibilityScheduleInstance -ExpandProperty "*" -All
+    Write-Output "Checking access for user: $userPrincipalName"
 
-foreach($Role in $EligileAssignments) {
-    if($Role.Principal.AdditionalProperties.'@odata.type' -eq "#microsoft.graph.user") {
-        # Get the last sign-in for the user
-        $auditLogs = Get-MgAuditLogSignIn -Filter "userId eq '$($Role.Principal.AdditionalProperties.id)' and activityDisplayName eq 'Activate role'" -Top 1
-        $lastUsed = if ($auditLogs) { $auditLogs[0].createdDateTime } else { "None" }
-
-        $UserProperties = [pscustomobject]@{
-            DisplayName = $Role.Principal.AdditionalProperties.displayName
-            UserPrincipalName = $Role.Principal.AdditionalProperties.userPrincipalName
-            AccountEnabled = $Role.Principal.AdditionalProperties.accountEnabled
-            StartDateTime = $Role.StartDateTime
-            EndDateTime = $Role.EndDateTime
-            MemberType = $Role.MemberType
-            RoleName = $Role.RoleDefinition.DisplayName
-            RoleID = $Role.RoleDefinition.Id
-            LastUsed = $lastUsed
-        }
-        $EligibleEntraUserData += $UserProperties
+    # Check if the user has any access to any Azure subscriptions
+    $subscriptions = Get-AzRoleAssignment -SignInName $userPrincipalName -ErrorAction SilentlyContinue
+    $subscriptionNames = @()
+    if ($subscriptions) {
+        $subscriptionNames = $subscriptions | ForEach-Object { $_.Scope }
     }
-    else {
-        $GroupProperties = [pscustomobject]@{
-            DisplayName = $Role.Principal.AdditionalProperties.displayName
-            IsAssignableToRole = $Role.Principal.AdditionalProperties.isAssignableToRole
-            StartDateTime = $Role.StartDateTime
-            EndDateTime = if ($null -eq $Role.EndDateTime) { "Permanent" } else { $Role.EndDateTime }
-            MemberType = $Role.MemberType
-            RoleName = $Role.RoleDefinition.DisplayName
-            RoleID = $Role.RoleDefinition.Id
-        }
-        $EligibleEntraGroupData += $GroupProperties
 
-        # Get group members
-        $groupMembers = Get-MgGroupMember -GroupId $Role.Principal.AdditionalProperties.id -All
-        foreach ($member in $groupMembers) {
-            if ($member.'@odata.type' -eq '#microsoft.graph.user') {
-                # Get the last sign-in for the group member
-                $auditLogs = Get-MgAuditLogSignIn -Filter "userId eq '$($member.id)' and activityDisplayName eq 'Activate role'" -Top 1
-                $lastUsed = if ($auditLogs) { $auditLogs[0].createdDateTime } else { "None" }
-
-                $UserProperties = [pscustomobject]@{
-                    DisplayName = $member.DisplayName
-                    UserPrincipalName = $member.UserPrincipalName
-                    Group = $Role.Principal.AdditionalProperties.displayName
-                    LastUsed = $lastUsed
-                }
-                $EligibleEntraUserData += $UserProperties
-            }
-        }
+    # Check if the user is assigned any direct roles in the tenant
+    $userId = (Get-MgUser -UserPrincipalName $userPrincipalName).Id
+    $directRoles = Get-MgUserAppRoleAssignment -UserId $userId -ErrorAction SilentlyContinue
+    $roleNames = @()
+    if ($directRoles) {
+        $roleNames = $directRoles | ForEach-Object { $_.AppRoleId } # Needs mapping to human-readable names
     }
+
+    # Check if the user is eligible for any PIM roles
+    $pimRoles = Get-MgPrivilegedRoleAssignment -Filter "principalId eq '$userId' and assignmentState eq 'Eligible'"
+    $pimRoleNames = @()
+    if ($pimRoles) {
+        $pimRoleNames = $pimRoles | ForEach-Object { $_.RoleDefinitionId } # Needs mapping to human-readable names
+    }
+
+    # Create an object for the result
+    $result = [PSCustomObject]@{
+        UserPrincipalName = $userPrincipalName
+        Subscriptions = ($subscriptionNames -join ", ")
+        AssignedRoles = ($roleNames -join ", ")
+        PIMAssignments = ($pimRoleNames -join ", ")
+    }
+
+    # Add the result to the list
+    $results += $result
 }
 
-# Print out the details
-$EligibleEntraUserData
-$EligibleEntraGroupData
+# Export the results to a CSV file
+$results | Export-Csv -Path "UserAccessReport.csv" -NoTypeInformation
 
-# Disconnect from Microsoft Graph
+# Disconnect from Azure and Microsoft Graph
+Disconnect-AzAccount
 Disconnect-MgGraph
+
+Write-Output "User access report exported to UserAccessReport.csv"
